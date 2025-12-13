@@ -1,0 +1,398 @@
+import numpy as np
+import time
+import math
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# 0) Naive dense matrix multiplication (no BLAS, no vectorization)
+# ============================================================
+
+def naive_matmul(A, B):
+    """
+    Completely naive dense matrix multiplication C = A @ B
+    using explicit Python scalar loops.
+
+    Parameters
+    ----------
+    A : np.ndarray of shape (m, d)
+    B : np.ndarray of shape (d, n)
+
+    Returns
+    -------
+    C : np.ndarray of shape (m, n)
+    """
+    m, d = A.shape
+    d2, n = B.shape
+    assert d == d2, "Inner dimensions must match."
+
+    C = np.zeros((m, n), dtype=float)
+
+    for i in range(m):
+        for k in range(d):
+            a_ik = A[i, k]
+            for j in range(n):
+                C[i, j] += a_ik * B[k, j]
+
+    return C
+
+
+# ============================================================
+# 1) Naive 1D FWHT (no vectorized slices)
+# ============================================================
+
+def fwht_1d_inplace(v):
+    """
+    Completely naive in-place FWHT on a 1D vector v.
+
+    d must be a power of 2.
+    This uses only Python scalar loops, no slicing.
+
+    Parameters
+    ----------
+    v : 1D np.ndarray of length d
+
+    Returns
+    -------
+    v : transformed vector (same object)
+    """
+    d = v.shape[0]
+    h = 1
+    while h < d:
+        step = 2 * h
+        for i in range(0, d, step):
+            for j in range(h):
+                a = v[i + j]
+                b = v[i + j + h]
+                v[i + j] = a + b
+                v[i + j + h] = a - b
+        h *= 2
+    return v
+
+
+# ============================================================
+# 2) Dense ORF: setup + per-sample naive kernel
+# ============================================================
+
+def setup_dense_orf(d, rng=None):
+    """
+    Setup for dense ORF with m = d features.
+
+    We still use np.linalg.qr here (BLAS) for the offline step,
+    because algorithmically dense ORF requires a QR
+    to obtain orthogonal rows from a Gaussian matrix.
+
+    Parameters
+    ----------
+    d : int
+        Feature dimension.
+    rng : np.random.Generator or None
+
+    Returns
+    -------
+    W : np.ndarray of shape (d, d)
+        Projection matrix (rows are g_i^T).
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    G = rng.standard_normal(size=(d, d))
+    Q, _ = np.linalg.qr(G)
+    W = math.sqrt(d) * Q
+    return W
+
+
+def kernel_dense_orf_single(W, x, y):
+    """
+    Compute hat{k}_m(x, y) for a single pair (x, y)
+    using dense ORF and fully naive operations.
+
+    Steps:
+      1) WX = W @ x   (naive_matmul with n=1)
+      2) WY = W @ y
+      3) relu(WX), relu(WY)
+      4) dot(relu(WX), relu(WY))
+
+    Parameters
+    ----------
+    W : np.ndarray of shape (m, d)
+    x, y : 1D np.ndarray of length d
+
+    Returns
+    -------
+    k_hat : float
+    """
+    m, d = W.shape
+    # reshape x,y to (d,1) for naive_matmul
+    X = x.reshape(d, 1)
+    Y = y.reshape(d, 1)
+
+    WX = naive_matmul(W, X).reshape(m)
+    WY = naive_matmul(W, Y).reshape(m)
+
+    # ReLU via loops
+    for i in range(m):
+        if WX[i] < 0.0:
+            WX[i] = 0.0
+        if WY[i] < 0.0:
+            WY[i] = 0.0
+
+    # Dot via loop
+    s = 0.0
+    for i in range(m):
+        s += WX[i] * WY[i]
+
+    return s / m
+
+
+# ============================================================
+# 3) Structured ORF: setup + per-sample naive kernel
+# ============================================================
+
+def setup_structured_orf(d, rng=None):
+    """
+    Setup for structured ORF with m = d features (one block).
+
+    We use the template W = D3 U D2 U D1 U and only store the
+    diagonal signs D1, D2, D3.
+
+    Parameters
+    ----------
+    d : int
+        Dimension (power of 2).
+    rng : np.random.Generator or None
+
+    Returns
+    -------
+    D1, D2, D3 : 1D np.ndarray of length d with entries in {-1, +1}
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    if d & (d - 1) != 0:
+        raise ValueError("d must be a power of 2 for Hadamard-based ORF.")
+
+    D1 = rng.integers(0, 2, size=d)
+    D2 = rng.integers(0, 2, size=d)
+    D3 = rng.integers(0, 2, size=d)
+
+    # Map {0,1} -> {-1,+1}
+    D1 = 2.0 * D1 - 1.0
+    D2 = 2.0 * D2 - 1.0
+    D3 = 2.0 * D3 - 1.0
+
+    return D1.astype(float), D2.astype(float), D3.astype(float)
+
+
+def apply_structured_orf_single(D1, D2, D3, v):
+    """
+    Apply W = D3 U D2 U D1 U to a single vector v
+    using completely naive FWHT (no vectorization).
+
+    Parameters
+    ----------
+    D1, D2, D3 : 1D np.ndarray of length d
+        Rademacher sign vectors.
+    v : 1D np.ndarray of length d
+
+    Returns
+    -------
+    wv : 1D np.ndarray of length d
+        W v
+    """
+    d = v.shape[0]
+    x = v.astype(float).copy()
+
+    # First U
+    fwht_1d_inplace(x)
+    scale = 1.0 / math.sqrt(d)
+    for i in range(d):
+        x[i] *= scale
+        x[i] *= D1[i]
+
+    # Second U
+    fwht_1d_inplace(x)
+    for i in range(d):
+        x[i] *= scale
+        x[i] *= D2[i]
+
+    # Third U
+    fwht_1d_inplace(x)
+    for i in range(d):
+        x[i] *= scale
+        x[i] *= D3[i]
+
+    return x
+
+
+def kernel_structured_orf_single(D1, D2, D3, x, y):
+    """
+    Compute hat{k}_m(x, y) for a single pair (x, y)
+    using structured ORF and fully naive operations.
+
+    Parameters
+    ----------
+    D1, D2, D3 : 1D np.ndarray of length d
+    x, y : 1D np.ndarray of length d
+
+    Returns
+    -------
+    k_hat : float
+    """
+    d = x.shape[0]
+    # m = d features in this simple construction
+    m = d
+
+    Wx = apply_structured_orf_single(D1, D2, D3, x)
+    Wy = apply_structured_orf_single(D1, D2, D3, y)
+
+    # ReLU
+    for i in range(m):
+        if Wx[i] < 0.0:
+            Wx[i] = 0.0
+        if Wy[i] < 0.0:
+            Wy[i] = 0.0
+
+    # Dot
+    s = 0.0
+    for i in range(m):
+        s += Wx[i] * Wy[i]
+
+    return s / m
+
+
+# ============================================================
+# 4) Benchmark: setup + online per-sample time (naive both sides)
+# ============================================================
+
+def benchmark_runtime(
+    d_list=(32, 64, 128),
+    num_samples=20,
+    seed=0,
+):
+    """
+    Benchmark setup time and average online time of
+    dense ORF vs structured ORF, with fully naive
+    Python implementations (no BLAS, no vectorized FWHT).
+
+    Parameters
+    ----------
+    d_list : iterable of int
+        Dimensions to test (must be powers of 2 for ORF).
+    num_samples : int
+        Number of (x, y) pairs per dimension.
+    seed : int
+        Random seed.
+
+    Returns
+    -------
+    results : dict
+        {
+          "dense_setup": {d: time},
+          "struct_setup": {d: time},
+          "dense_online": {d: avg_time_per_sample},
+          "struct_online": {d: avg_time_per_sample},
+        }
+    """
+    rng = np.random.default_rng(seed)
+
+    dense_setup = {}
+    struct_setup = {}
+    dense_online = {}
+    struct_online = {}
+
+    for d in d_list:
+        print(f"\n=== Dimension d = {d} ===")
+
+        # ----- Setup -----
+        t0 = time.perf_counter()
+        W_dense = setup_dense_orf(d, rng=rng)
+        t1 = time.perf_counter()
+        dense_setup[d] = t1 - t0
+
+        t0 = time.perf_counter()
+        D1, D2, D3 = setup_structured_orf(d, rng=rng)
+        t1 = time.perf_counter()
+        struct_setup[d] = t1 - t0
+
+        print(f"Dense ORF setup time      : {dense_setup[d]:.4f} s")
+        print(f"Structured ORF setup time : {struct_setup[d]:.4f} s")
+
+        # ----- Online -----
+        total_dense = 0.0
+        total_struct = 0.0
+
+        for _ in range(num_samples):
+            x = rng.standard_normal(size=d)
+            y = rng.standard_normal(size=d)
+
+            # Dense ORF
+            t0 = time.perf_counter()
+            _ = kernel_dense_orf_single(W_dense, x, y)
+            t1 = time.perf_counter()
+            total_dense += (t1 - t0)
+
+            # Structured ORF
+            t0 = time.perf_counter()
+            _ = kernel_structured_orf_single(D1, D2, D3, x, y)
+            t1 = time.perf_counter()
+            total_struct += (t1 - t0)
+
+        dense_online[d] = total_dense / num_samples
+        struct_online[d] = total_struct / num_samples
+
+        print(f"Avg per-sample time, dense ORF      : {dense_online[d]*1e3:.3f} ms")
+        print(f"Avg per-sample time, structured ORF : {struct_online[d]*1e3:.3f} ms")
+
+    results = {
+        "dense_setup": dense_setup,
+        "struct_setup": struct_setup,
+        "dense_online": dense_online,
+        "struct_online": struct_online,
+    }
+    return results
+
+
+# ============================================================
+# 5) Run and (optionally) visualize
+# ============================================================
+
+if __name__ == "__main__":
+    # WARNING: naive implementations are very slow.
+    d_list = [32, 64, 128, 256]
+    num_samples = 500
+
+    results = benchmark_runtime(
+        d_list=d_list,
+        num_samples=num_samples,
+        seed=0,
+    )
+
+    ds = np.array(d_list, dtype=float)
+    dense_setup = np.array([results["dense_setup"][d] for d in d_list])
+    struct_setup = np.array([results["struct_setup"][d] for d in d_list])
+    dense_online = np.array([results["dense_online"][d] for d in d_list])
+    struct_online = np.array([results["struct_online"][d] for d in d_list])
+
+    # Setup time
+    plt.figure(figsize=(7, 5))
+    plt.loglog(ds, dense_setup, marker="o", label="Dense ORF setup")
+    plt.loglog(ds, struct_setup, marker="s", label="Structured ORF setup")
+    plt.xlabel("Dimension d (log scale)")
+    plt.ylabel("Setup time (seconds, log scale)")
+    plt.title("Setup: Dense ORF (QR) vs Structured ORF (signs only)")
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+
+    # Online time
+    plt.figure(figsize=(7, 5))
+    plt.loglog(ds, dense_online, marker="o", label="Dense ORF (naive)")
+    plt.loglog(ds, struct_online, marker="s", label="Structured ORF (naive FWHT)")
+    plt.xlabel("Dimension d (log scale)")
+    plt.ylabel("Avg per-sample kernel time (seconds, log scale)")
+    plt.title("Online runtime: Dense ORF O(d^2) vs Structured ORF O(d log d)")
+    plt.grid(True, which="both", ls="--", alpha=0.5)
+    plt.legend()
+    plt.tight_layout()
+
+    plt.show()
